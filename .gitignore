@@ -1,0 +1,4 @@
+flox-auto-activate
+flox-auto-activate-*
+*.test
+*.out
