@@ -140,9 +140,15 @@ flox-auto-activate: allow auto-activation for /Users/you/proj? [y/N]
 Pre-approve from your dotfiles:
 
 ```sh
-flox-auto-activate allow ~/code/some-project
-flox-auto-activate allow ~/code/another        # path doesn't need to exist yet
+flox-auto-activate allow ~/code/some-project              # path must exist
+flox-auto-activate allow --preapprove ~/code/another      # path may not exist yet
 ```
+
+`--preapprove` is required when the target path doesn't exist. Be
+careful: preapproving a path means anyone who can create that directory
+before you do can plant a `.flox` there and have it auto-activate
+without prompting. Only preapprove paths inside locations you
+exclusively control (e.g. your own `~/code/` tree).
 
 Revoke a previous decision:
 
