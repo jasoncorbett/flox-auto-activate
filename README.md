@@ -85,6 +85,28 @@ The hook eval needs to be late enough in your rc file that
 enough that subshells inherit it. Anywhere near where you put `direnv`
 is fine.
 
+## Updating
+
+```sh
+flox-auto-activate self-update                # install latest release in place
+flox-auto-activate self-update --check        # exit 0 if up to date, 10 if newer is available
+flox-auto-activate self-update --version v1.1.0   # pin to a specific tag
+flox-auto-activate self-update --force        # update a dev build, reinstall same version, or downgrade
+```
+
+`self-update` queries the GitHub releases API directly via `net/http`
+(no `gh` CLI dependency), picks the asset matching your `GOOS`/`GOARCH`,
+verifies the published `.sha256`, and atomically replaces the running
+binary in place. The old inode stays valid for any process that's
+already executing, so it's safe to update while shells are open.
+
+`--check` exits 0 / 10 / 1 (up-to-date / update-available / error) —
+handy for cron, shell-prompt nags, or a CI gate.
+
+Dev builds (`go build` without the release ldflags) refuse to update
+unless you pass `--force`, so iterating locally won't silently
+clobber your in-progress binary.
+
 ## Commands
 
 ```
