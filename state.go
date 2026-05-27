@@ -87,7 +87,7 @@ func (s *State) save() error {
 	}
 	data = append(data, '\n')
 	tmp := fmt.Sprintf("%s.tmp.%d", s.path, os.Getpid())
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, s.path); err != nil {

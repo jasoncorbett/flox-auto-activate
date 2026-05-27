@@ -9,11 +9,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+// maxBinaryBytes caps the self-update download so a hijacked or
+// misconfigured release endpoint can't fill the install partition
+// before the HTTP timeout fires. The released binary is ~9MB; 200MiB
+// is a comfortable ceiling.
+const maxBinaryBytes = 200 << 20
+
+// versionTagRe matches the tag form GitHub releases ship for this
+// project: optional leading 'v', MAJOR.MINOR.PATCH, optional
+// pre-release/build suffix. Anything that doesn't match never gets
+// pasted into a URL path.
+var versionTagRe = regexp.MustCompile(`^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$`)
 
 // errUpdateAvailable signals --check found a newer release. main.go
 // translates this into exit code 10.
@@ -52,6 +66,9 @@ func (s *selfUpdate) run(ctx context.Context, opts selfUpdateOpts) error {
 		err error
 	)
 	if opts.Version != "" {
+		if !versionTagRe.MatchString(opts.Version) {
+			return fmt.Errorf("invalid --version %q: expected vMAJOR.MINOR.PATCH (e.g. v1.2.3)", opts.Version)
+		}
 		rel, err = s.releaseByTag(ctx, opts.Version)
 	} else {
 		rel, err = s.latestRelease(ctx)
@@ -95,12 +112,12 @@ func (s *selfUpdate) run(ctx context.Context, opts selfUpdateOpts) error {
 	}
 
 	destDir := filepath.Dir(s.selfPath)
-	tmpPath, err := s.downloadAndVerify(ctx, binURL, shaURL, destDir)
+	tmpPath, wantHex, err := s.downloadAndVerify(ctx, binURL, shaURL, destDir)
 	if err != nil {
 		return err
 	}
 
-	if err := s.replaceBinary(tmpPath, s.selfPath); err != nil {
+	if err := s.replaceBinary(tmpPath, s.selfPath, wantHex); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
@@ -125,7 +142,7 @@ func (s *selfUpdate) latestRelease(ctx context.Context) (*release, error) {
 }
 
 func (s *selfUpdate) releaseByTag(ctx context.Context, tag string) (*release, error) {
-	return s.fetchRelease(ctx, s.apiBase+"/repos/"+s.repo+"/releases/tags/"+tag)
+	return s.fetchRelease(ctx, s.apiBase+"/repos/"+s.repo+"/releases/tags/"+url.PathEscape(tag))
 }
 
 func (s *selfUpdate) fetchRelease(ctx context.Context, url string) (*release, error) {
@@ -168,62 +185,81 @@ func assetFor(r *release, goos, goarch string) (binURL, shaURL string, err error
 	return binURL, shaURL, nil
 }
 
-func (s *selfUpdate) downloadAndVerify(ctx context.Context, binURL, shaURL, destDir string) (string, error) {
+func (s *selfUpdate) downloadAndVerify(ctx context.Context, binURL, shaURL, destDir string) (string, string, error) {
 	shaResp, err := s.get(ctx, shaURL, "")
 	if err != nil {
-		return "", fmt.Errorf("fetch checksum: %w", err)
+		return "", "", fmt.Errorf("fetch checksum: %w", err)
 	}
 	shaBytes, err := io.ReadAll(io.LimitReader(shaResp.Body, 4096))
 	shaResp.Body.Close()
 	if err != nil {
-		return "", fmt.Errorf("read checksum: %w", err)
+		return "", "", fmt.Errorf("read checksum: %w", err)
 	}
 	if shaResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch checksum: %s", shaResp.Status)
+		return "", "", fmt.Errorf("fetch checksum: %s", shaResp.Status)
 	}
 	fields := strings.Fields(string(shaBytes))
 	if len(fields) == 0 {
-		return "", fmt.Errorf("checksum response empty")
+		return "", "", fmt.Errorf("checksum response empty")
 	}
 	wantHex := strings.ToLower(fields[0])
 	if len(wantHex) != 64 {
-		return "", fmt.Errorf("checksum response malformed: %q", string(shaBytes))
+		return "", "", fmt.Errorf("checksum response malformed: %q", string(shaBytes))
 	}
 
 	binResp, err := s.get(ctx, binURL, "")
 	if err != nil {
-		return "", fmt.Errorf("fetch binary: %w", err)
+		return "", "", fmt.Errorf("fetch binary: %w", err)
 	}
 	defer binResp.Body.Close()
 	if binResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch binary: %s", binResp.Status)
+		return "", "", fmt.Errorf("fetch binary: %s", binResp.Status)
 	}
 
 	tmpName := fmt.Sprintf("flox-auto-activate.new.%d", os.Getpid())
 	tmpPath := filepath.Join(destDir, tmpName)
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+	// Mode 0o700: only the installing user can read/write the temp
+	// binary, narrowing the TOCTOU window between download and rename.
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
 	if err != nil {
-		return "", fmt.Errorf("create %s: %w", tmpPath, err)
+		return "", "", fmt.Errorf("create %s: %w", tmpPath, err)
 	}
 	hasher := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(f, hasher), binResp.Body); err != nil {
+	// Cap the download. If the body is exactly at the cap, that's
+	// suspicious — the released binary is much smaller — so reject
+	// it and let the user retry rather than silently truncating.
+	limited := io.LimitReader(binResp.Body, maxBinaryBytes+1)
+	n, err := io.Copy(io.MultiWriter(f, hasher), limited)
+	if err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return "", fmt.Errorf("download body: %w", err)
+		return "", "", fmt.Errorf("download body: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmpPath)
-		return "", err
+		return "", "", err
+	}
+	if n > maxBinaryBytes {
+		os.Remove(tmpPath)
+		return "", "", fmt.Errorf("download exceeds %d bytes; aborting", maxBinaryBytes)
 	}
 	gotHex := hex.EncodeToString(hasher.Sum(nil))
 	if gotHex != wantHex {
 		os.Remove(tmpPath)
-		return "", fmt.Errorf("checksum mismatch: got %s, want %s", gotHex, wantHex)
+		return "", "", fmt.Errorf("checksum mismatch: got %s, want %s", gotHex, wantHex)
 	}
-	return tmpPath, nil
+	return tmpPath, wantHex, nil
 }
 
-func (s *selfUpdate) replaceBinary(newPath, selfPath string) error {
+func (s *selfUpdate) replaceBinary(newPath, selfPath, wantHex string) error {
+	// Re-hash from disk just before rename. Closes the TOCTOU window
+	// between download-time hashing and the rename: if anything on
+	// the filesystem tampered with the temp file in between (e.g. a
+	// concurrent local process replaced it via the install dir), the
+	// hash will diverge and we refuse to install it.
+	if err := verifyFileHash(newPath, wantHex); err != nil {
+		return err
+	}
 	if err := os.Chmod(newPath, 0o755); err != nil {
 		return err
 	}
@@ -232,6 +268,23 @@ func (s *selfUpdate) replaceBinary(newPath, selfPath string) error {
 			return fmt.Errorf("cannot write to %s: %w (try installing to a user-owned path, or run with sudo)", filepath.Dir(selfPath), err)
 		}
 		return fmt.Errorf("replace %s: %w", selfPath, err)
+	}
+	return nil
+}
+
+func verifyFileHash(path, wantHex string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("reopen for verify: %w", err)
+	}
+	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return fmt.Errorf("rehash: %w", err)
+	}
+	gotHex := hex.EncodeToString(hasher.Sum(nil))
+	if gotHex != wantHex {
+		return fmt.Errorf("checksum mismatch on re-verify: got %s, want %s (temp file may have been tampered with)", gotHex, wantHex)
 	}
 	return nil
 }

@@ -133,17 +133,21 @@ and FLOX_ENV env vars to decide what to emit:
     if denied; prompt interactively if unknown.
 `,
 
-	"allow": `usage: flox-auto-activate allow [path]
+	"allow": `usage: flox-auto-activate allow [--preapprove] [path]
 
 Approve auto-activation for the .flox-containing directory at <path>.
 With no argument, uses the nearest .flox walking up from the current
 directory.
 
-The path does not need to exist yet; preapproval works for dotfile
-bootstrap (e.g. before you clone the repo). Paths are cleaned and made
-absolute before being stored.
+By default <path> must already exist. To approve a path that does not
+exist yet (dotfile bootstrap, before you clone the repo), pass
+--preapprove. Be careful: preapproving a path means anyone who can
+create that directory before you do can plant a .flox there and have it
+auto-activate without prompting. Only preapprove paths inside locations
+you exclusively control.
 
-Any matching deny record is removed.
+Paths are cleaned and made absolute before being stored. Any matching
+deny record is removed.
 `,
 
 	"deny": `usage: flox-auto-activate deny [path]
@@ -329,13 +333,37 @@ func resolvePathArg(args []string) (string, error) {
 }
 
 func cmdAllow(args []string, stdout io.Writer) error {
-	if len(args) == 1 && isHelpFlag(args[0]) {
-		fmt.Fprint(stdout, subcommandHelp["allow"])
-		return nil
+	var (
+		preapprove bool
+		positional []string
+	)
+	for _, a := range args {
+		if isHelpFlag(a) {
+			fmt.Fprint(stdout, subcommandHelp["allow"])
+			return nil
+		}
+		if a == "--preapprove" {
+			preapprove = true
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			return fmt.Errorf("unknown flag: %s", a)
+		}
+		positional = append(positional, a)
 	}
-	path, err := resolvePathArg(args)
+	path, err := resolvePathArg(positional)
 	if err != nil {
 		return err
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return statErr
+		}
+		if !preapprove {
+			return fmt.Errorf("path does not exist: %s\n"+
+				"  pass --preapprove if you really want to approve a path before it exists.\n"+
+				"  see `flox-auto-activate help allow` for the squatting risk this implies.", path)
+		}
 	}
 	state, err := loadState()
 	if err != nil {
@@ -345,7 +373,11 @@ func cmdAllow(args []string, stdout io.Writer) error {
 	if err := state.save(); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "allowed: %s\n", path)
+	if preapprove {
+		fmt.Fprintf(stdout, "preapproved: %s\n", path)
+	} else {
+		fmt.Fprintf(stdout, "allowed: %s\n", path)
+	}
 	return nil
 }
 
