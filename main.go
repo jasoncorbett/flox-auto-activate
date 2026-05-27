@@ -1,16 +1,27 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
 )
+
+const githubRepo = "jasoncorbett/flox-auto-activate"
 
 var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		if errors.Is(err, errUpdateAvailable) {
+			os.Exit(10)
+		}
 		fmt.Fprintln(os.Stderr, "flox-auto-activate: "+err.Error())
 		os.Exit(1)
 	}
@@ -34,6 +45,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return cmdStatus(args[1:], stdout)
 	case "services":
 		return cmdServices(args[1:], stdout)
+	case "self-update":
+		return cmdSelfUpdate(args[1:], stdout)
 	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, version)
 		return nil
@@ -73,6 +86,7 @@ commands:
   services <on|off|default> [path]
                       set per-path service-start preference; default
                       means "respect the env manifest"
+  self-update [flags] download and install the latest release in place
   version             print version
   help [command]      print this help, or detailed help for <command>
 
@@ -172,6 +186,30 @@ auto-started. Use ` + "`services on`" + ` per-path to opt in.
 	"version": `usage: flox-auto-activate version
 
 Print the version of the binary and exit.
+`,
+
+	"self-update": `usage: flox-auto-activate self-update [--check] [--force] [--version vX.Y.Z]
+
+Download the latest release of flox-auto-activate from GitHub and
+replace the running binary in place. The replacement is atomic
+(os.Rename over the executable), so any currently-running process
+keeps its existing binary until it exits.
+
+The integrity of the download is verified against the per-asset
+.sha256 file published in the release. Network requests go through
+Go's net/http directly; the gh CLI is not required.
+
+flags:
+  --check              print whether an update is available; exit 0
+                       if up to date, 10 if newer is available
+  --force              proceed even when the running binary is a dev
+                       build, the same version, or newer than the
+                       target
+  --version vX.Y.Z     install a specific release tag instead of the
+                       latest
+
+Dev builds (` + "`go build`" + ` without the release ldflags) refuse to update
+unless --force is given.
 `,
 
 	"help": `usage: flox-auto-activate help [command]
@@ -397,4 +435,52 @@ func cmdServices(args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "services default: %s\n", path)
 	}
 	return state.save()
+}
+
+func cmdSelfUpdate(args []string, stdout io.Writer) error {
+	var opts selfUpdateOpts
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case isHelpFlag(a):
+			fmt.Fprint(stdout, subcommandHelp["self-update"])
+			return nil
+		case a == "--check":
+			opts.Check = true
+		case a == "--force":
+			opts.Force = true
+		case a == "--version":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--version requires a tag argument (e.g. v1.0.0)")
+			}
+			i++
+			opts.Version = args[i]
+		case strings.HasPrefix(a, "--version="):
+			opts.Version = strings.TrimPrefix(a, "--version=")
+		default:
+			return fmt.Errorf("unknown flag: %s", a)
+		}
+	}
+	if opts.Version != "" && !strings.HasPrefix(opts.Version, "v") {
+		opts.Version = "v" + opts.Version
+	}
+
+	self, err := selfPath()
+	if err != nil {
+		return err
+	}
+
+	s := &selfUpdate{
+		apiBase:    "https://api.github.com",
+		repo:       githubRepo,
+		http:       &http.Client{Timeout: 120 * time.Second},
+		currentVer: version,
+		goos:       runtime.GOOS,
+		goarch:     runtime.GOARCH,
+		selfPath:   self,
+		out:        stdout,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	return s.run(ctx, opts)
 }
